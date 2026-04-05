@@ -1,0 +1,11 @@
+# Claude settings
+.claude/
+
+# Database
+*.db
+
+# Protoc binary archives
+*.zip
+
+# Go build output
+*.exe

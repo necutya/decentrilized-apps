@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package ticketpb;
+
+option go_package = "github.com/necutya/decentrilized_apps/lab1/gen/ticketpb";
+
+// ─── Auth ────────────────────────────────────────────────────────────────────
+
+message RegisterRequest {
+  string username = 1;
+  string password = 2;
+  string email    = 3;
+}
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message AuthResponse {
+  string token    = 1;
+  string username = 2;
+}
+
+service AuthService {
+  rpc Register (RegisterRequest) returns (AuthResponse);
+  rpc Login    (LoginRequest)    returns (AuthResponse);
+}
+
+// ─── Events & Bookings ───────────────────────────────────────────────────────
+
+message Event {
+  int64  id              = 1;
+  string title           = 2;
+  string venue           = 3;
+  string date            = 4;
+  int32  available_seats = 5;
+  int32  total_seats     = 6;
+  double price           = 7;
+}
+
+message ListEventsRequest  {}
+message ListEventsResponse { repeated Event events = 1; }
+
+message GetEventRequest { int64 id = 1; }
+
+message BookTicketRequest {
+  int64 event_id = 1;
+  int32 seats    = 2;
+}
+
+message Booking {
+  int64  id          = 1;
+  int64  event_id    = 2;
+  string event_title = 3;
+  int32  seats       = 4;
+  string status      = 5;
+  double total_price = 6;
+}
+
+message ListBookingsRequest  {}
+message ListBookingsResponse { repeated Booking bookings = 1; }
+
+message CancelBookingRequest  { int64 id = 1; }
+message CancelBookingResponse { bool  ok = 1; }
+
+service TicketService {
+  rpc ListEvents     (ListEventsRequest)    returns (ListEventsResponse);
+  rpc GetEvent       (GetEventRequest)      returns (Event);
+  rpc BookTicket     (BookTicketRequest)    returns (Booking);
+  rpc ListMyBookings (ListBookingsRequest)  returns (ListBookingsResponse);
+  rpc CancelBooking  (CancelBookingRequest) returns (CancelBookingResponse);
+}
