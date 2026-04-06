@@ -1,0 +1,50 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api-service:
+    build:
+      context: ./api-service
+      dockerfile: Dockerfile
+    environment:
+      GRPC_ADDR: ":50052"
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+      DB_PATH: "/data/api.db"
+    ports:
+      - "50052:50052"
+    volumes:
+      - api-data:/data
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  worker-service:
+    build:
+      context: ./worker-service
+      dockerfile: Dockerfile
+    environment:
+      GRPC_ADDR: ":50053"
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+      DB_PATH: "/data/worker.db"
+    ports:
+      - "50053:50053"
+    volumes:
+      - worker-data:/data
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  api-data:
+  worker-data:

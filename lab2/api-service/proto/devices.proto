@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package devicepb;
+
+option go_package = "github.com/necutya/decentrilized_apps/lab2/api-service/gen/devicepb";
+
+service DeviceService {
+  rpc CreateDevice(CreateDeviceRequest) returns (DeviceResponse);
+  rpc GetDevice(GetDeviceRequest) returns (DeviceResponse);
+  rpc UpdateDevice(UpdateDeviceRequest) returns (DeviceResponse);
+  rpc DeleteDevice(DeleteDeviceRequest) returns (DeleteDeviceResponse);
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
+}
+
+message DeviceType {
+  bool peripheral   = 1;
+  int32 power_watts = 2;
+  bool has_cooler   = 3;
+  string group      = 4;
+  repeated string ports = 5;
+}
+
+message Device {
+  uint64 id       = 1;
+  string name     = 2;
+  string origin   = 3;
+  double price    = 4;
+  bool critical   = 5;
+  DeviceType device_type = 6;
+}
+
+message CreateDeviceRequest {
+  string name     = 1;
+  string origin   = 2;
+  double price    = 3;
+  bool critical   = 4;
+  DeviceType device_type = 5;
+}
+
+message GetDeviceRequest   { uint64 id = 1; }
+message DeleteDeviceRequest { uint64 id = 1; }
+
+message UpdateDeviceRequest {
+  uint64 id       = 1;
+  string name     = 2;
+  string origin   = 3;
+  double price    = 4;
+  bool critical   = 5;
+  DeviceType device_type = 6;
+}
+
+message DeviceResponse       { Device device = 1; }
+message DeleteDeviceResponse { bool success  = 1; }
+message ListDevicesRequest   {}
+message ListDevicesResponse  { repeated Device devices = 1; }

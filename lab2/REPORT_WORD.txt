@@ -1,0 +1,513 @@
+Лабораторна робота №2
+Тема: Робота з брокерами повідомлень – RabbitMQ
+
+
+Мета роботи
+
+Розробити розподілений застосунок, розбитий на два мікросервіси, що взаємодіють через брокер повідомлень RabbitMQ. Перший сервіс приймає gRPC-запити від клієнта, валідує дані та публікує події до черги. Другий сервіс споживає повідомлення з черги, зберігає дані у власній базі даних та збирає статистику обробки подій.
+
+
+Теоретичні відомості
+
+Брокер повідомлень — програмний посередник, що забезпечує асинхронну передачу повідомлень між сервісами. Відправник (producer) публікує повідомлення, не чекаючи відповіді; отримувач (consumer) опрацьовує їх у власному темпі. Це забезпечує слабку зв'язаність (loose coupling) і незалежне масштабування сервісів.
+
+RabbitMQ — популярний брокер повідомлень, що реалізує протокол AMQP (Advanced Message Queuing Protocol). Основні поняття протоколу:
+
+Producer — сервіс, що публікує повідомлення до черги.
+Consumer — сервіс, що читає та обробляє повідомлення з черги.
+Queue — буфер, в якому зберігаються повідомлення до моменту їх обробки.
+Exchange — маршрутизатор повідомлень від producer до відповідної черги.
+Binding — зв'язок між exchange і конкретною чергою.
+Ack / Nack — механізм підтвердження успішної або невдалої обробки повідомлення.
+
+Режими підтвердження повідомлень:
+
+Auto-ack — повідомлення видаляється з черги одразу після доставки споживачу, незалежно від результату обробки.
+Manual ack — повідомлення видаляється з черги лише після явного підтвердження споживачем. Якщо обробка завершилась помилкою, видається nack і повідомлення повертається до черги для повторної обробки.
+
+Durable queue + Persistent messages — черга та повідомлення зберігаються на диску і залишаються після перезапуску RabbitMQ, що забезпечує надійність доставки.
+
+Архітектура застосунку складається з двох сервісів. Клієнт надсилає gRPC-запити до api-service. Цей сервіс зберігає дані у своїй SQLite базі та публікує JSON-подію до черги device.events. Worker-service підписаний на цю чергу, споживає повідомлення, зберігає дані у власну SQLite базу та оновлює статистику. Крім того, worker-service надає власний gRPC API для перегляду статистики та даних.
+
+
+Завдання
+
+1. Розгорнути RabbitMQ за допомогою Docker.
+2. Розробити api-service — gRPC-сервер для CRUD операцій над комп'ютерними комплектуючими (Device), що публікує події до черги RabbitMQ та зберігає дані у власній SQLite БД.
+3. Розробити worker-service — сервіс-споживач черги RabbitMQ, що зберігає дані у власній SQLite БД та збирає статистику подій (created / updated / deleted) у розрізі груп пристроїв.
+4. Додати до worker-service gRPC API для перегляду статистики та списку пристроїв.
+5. Протестувати повний потік даних: gRPC запит → черга → обробка → статистика.
+
+
+Хід роботи
+
+1. Розгортання RabbitMQ через Docker
+
+Для швидкого запуску RabbitMQ використано офіційний образ rabbitmq:3-management, що включає вбудований веб-інтерфейс управління. Конфігурацію описано у файлі docker-compose.yml. Черга оголошена як durable, повідомлення — persistent, що забезпечує збереження даних після перезапуску брокера.
+
+Запуск усього стеку виконується командою:
+
+    docker compose up -d
+
+Після успішного запуску в терміналі відображається:
+
+    [+] Running 3/3
+     ✔ Container lab2-rabbitmq-1        Healthy
+     ✔ Container lab2-api-service-1     Started
+     ✔ Container lab2-worker-service-1  Started
+
+Веб-інтерфейс RabbitMQ Management UI доступний за адресою http://localhost:15672 (логін: guest, пароль: guest).
+
+
+2. Структура проекту
+
+Проект розміщено у директорії lab2/ і складається з двох незалежних сервісів, кожен зі своїм go.mod, БД та Dockerfile:
+
+    lab2/
+    ├── docker-compose.yml
+    ├── api-service/
+    │   ├── proto/devices.proto       — специфікація DeviceService
+    │   ├── gen/devicepb/             — згенерований код
+    │   ├── internal/
+    │   │   ├── model/                — модель Device
+    │   │   ├── repo/                 — CRUD через GORM
+    │   │   ├── service/              — бізнес-логіка
+    │   │   ├── publisher/            — публікація подій до RabbitMQ
+    │   │   └── grpcserver/           — gRPC хендлери
+    │   └── cmd/main.go
+    └── worker-service/
+        ├── proto/stats.proto         — специфікація StatsService
+        ├── gen/statspb/              — згенерований код
+        ├── internal/
+        │   ├── model/                — Device, EventStat, LastProcessed
+        │   ├── repo/                 — device_repo, stats_repo
+        │   ├── service/              — обробка повідомлень
+        │   ├── consumer/             — споживач черги RabbitMQ
+        │   └── grpcserver/           — gRPC хендлери (stats)
+        └── cmd/main.go
+
+
+3. Proto-специфікація та генерація коду
+
+Контракт api-service описано у файлі proto/devices.proto. Сервіс DeviceService містить п'ять методів: CreateDevice, UpdateDevice, DeleteDevice, GetDevice, ListDevices. Модель пристрою включає поля: id, name, origin, price, critical, а також вкладений об'єкт device_type з полями peripheral, power_watts, has_cooler, group та ports (масив рядків).
+
+Контракт worker-service описано у файлі proto/stats.proto. Сервіс StatsService містить методи: GetStats (статистика подій), ListDevices та GetDevice (доступ до даних у БД воркера).
+
+Генерація Go-коду з .proto-файлів виконується скриптами generate.sh у кожному сервісі:
+
+    cd api-service && bash generate.sh
+    cd ../worker-service && bash generate.sh
+
+Результат — файли *.pb.go та *_grpc.pb.go у директоріях gen/devicepb/ та gen/statspb/ відповідно.
+
+
+4. Формат повідомлень черги
+
+Черга device.events використовує формат JSON. Кожне повідомлення містить поле event (значення: "created", "updated" або "deleted") та поле device з повними даними пристрою. Приклад повідомлення:
+
+    {
+      "event": "created",
+      "device": {
+        "ID": 4,
+        "Name": "RTX 4090",
+        "Origin": "Taiwan",
+        "Price": 1599.99,
+        "Critical": true,
+        "Peripheral": false,
+        "PowerWatts": 450,
+        "HasCooler": true,
+        "Group": "multimedia",
+        "Ports": ["PCIe"]
+      }
+    }
+
+
+5. Реалізація api-service
+
+При кожній write-операції (create/update/delete) сервіс виконує два кроки: зберігає зміни у власній SQLite БД та публікує JSON-повідомлення до черги device.events з відповідним типом події. Read-операції (get/list) звертаються лише до власної БД без взаємодії з чергою.
+
+При старті сервіс виконує підключення до RabbitMQ з повторними спробами (5 спроб, інтервал 2 секунди) та автоматично заповнює БД тестовими пристроями, якщо вона порожня. Лог запуску:
+
+    2025/04/06 12:00:01 seeded 3 devices
+    2025/04/06 12:00:01 gRPC server listening on :50052
+
+
+6. Реалізація worker-service
+
+Споживач черги використовує режим manual ack. Повідомлення підтверджується лише після успішної обробки. У разі помилки видається nack і повідомлення повертається до черги.
+
+При отриманні повідомлення з типом "created" або "updated" сервіс виконує upsert пристрою в БД. При типі "deleted" — видаляє відповідний запис. Після кожної операції інкрементується лічильник у таблиці event_stats з ключем (event_type, group) та оновлюється мітка часу останньої обробки.
+
+Worker-service надає gRPC сервер на порту :50053 з сервісом StatsService, що містить три методи:
+GetStats — повертає загальну кількість подій за типами (created, updated, deleted), розподіл по групах пристроїв та мітку часу останньої обробки;
+ListDevices — повертає повний список пристроїв з БД воркера;
+GetDevice — повертає один пристрій за ідентифікатором.
+
+
+7. Тестування повного потоку
+
+Для тестування використано утиліту grpcurl. Повний флоу автоматизовано у скрипті test_grpc.sh. Запуск:
+
+    bash test_grpc.sh
+
+api-service слухає на порту :50052 (DeviceService), worker-service — на порту :50053 (StatsService).
+
+Крок 1 — Список пристроїв api-service (заповнено автоматично при старті):
+
+    grpcurl -plaintext -d '{}' localhost:50052 devicepb.DeviceService/ListDevices
+
+Відповідь містить три пристрої: Logitech MX Keys (group: io), Corsair RM850x (group: io), Razer Kraken (group: multimedia).
+
+Крок 2 — Створення нового пристрою:
+
+    grpcurl -plaintext -d '{
+      "name": "RTX 4090", "origin": "Taiwan", "price": 1599.99, "critical": true,
+      "device_type": { "power_watts": 450, "has_cooler": true,
+                       "group": "multimedia", "ports": ["PCIe"] }
+    }' localhost:50052 devicepb.DeviceService/CreateDevice
+
+Відповідь: { "device": { "id": "4", "name": "RTX 4090", "price": 1599.99, ... } }
+Подія "created" одночасно публікується до черги device.events.
+
+Крок 3 — Оновлення пристрою:
+
+    grpcurl -plaintext -d '{
+      "id": 4, "name": "RTX 4090 Ti", "price": 1799.99, "critical": true,
+      "device_type": { "power_watts": 500, "has_cooler": true,
+                       "group": "multimedia", "ports": ["PCIe"] }
+    }' localhost:50052 devicepb.DeviceService/UpdateDevice
+
+Відповідь: { "device": { "id": "4", "name": "RTX 4090 Ti", "price": 1799.99, ... } }
+
+Крок 4 — Видалення пристрою:
+
+    grpcurl -plaintext -d '{"id": 4}' localhost:50052 devicepb.DeviceService/DeleteDevice
+
+Відповідь: { "success": true }
+
+Крок 5 — Отримання статистики через StatsService (worker-service):
+
+    grpcurl -plaintext -d '{}' localhost:50053 statspb.StatsService/GetStats
+
+Відповідь:
+    {
+      "totalCreated": "4",
+      "totalUpdated": "1",
+      "totalDeleted": "1",
+      "byGroup": [
+        { "group": "io",         "count": "3" },
+        { "group": "multimedia", "count": "3" }
+      ],
+      "lastProcessedAt": "2025-04-06T12:00:15Z"
+    }
+
+Крок 6 — Список пристроїв у БД worker-service:
+
+    grpcurl -plaintext -d '{}' localhost:50053 statspb.StatsService/ListDevices
+
+Відповідь містить три пристрої, що залишились після видалення четвертого.
+
+Крок 7 — Отримання одного пристрою за id з БД worker-service:
+
+    grpcurl -plaintext -d '{"id": 1}' localhost:50053 statspb.StatsService/GetDevice
+
+Відповідь: { "id": "1", "name": "Logitech MX Keys", "origin": "USA", ... }
+
+
+Лістинг програми
+
+--- api-service/proto/devices.proto ---
+
+syntax = "proto3";
+package devicepb;
+option go_package = "github.com/necutya/decentrilized_apps/lab2/api-service/gen/devicepb";
+
+service DeviceService {
+  rpc CreateDevice (CreateDeviceRequest) returns (DeviceResponse);
+  rpc GetDevice    (GetDeviceRequest)    returns (DeviceResponse);
+  rpc UpdateDevice (UpdateDeviceRequest) returns (DeviceResponse);
+  rpc DeleteDevice (DeleteDeviceRequest) returns (DeleteDeviceResponse);
+  rpc ListDevices  (ListDevicesRequest)  returns (ListDevicesResponse);
+}
+
+message DeviceType {
+  bool peripheral = 1; int32 power_watts = 2;
+  bool has_cooler = 3; string group = 4;
+  repeated string ports = 5;
+}
+message Device {
+  uint64 id = 1; string name = 2; string origin = 3;
+  double price = 4; bool critical = 5; DeviceType device_type = 6;
+}
+message CreateDeviceRequest {
+  string name = 1; string origin = 2; double price = 3;
+  bool critical = 4; DeviceType device_type = 5;
+}
+message UpdateDeviceRequest {
+  uint64 id = 1; string name = 2; string origin = 3;
+  double price = 4; bool critical = 5; DeviceType device_type = 6;
+}
+message GetDeviceRequest     { uint64 id = 1; }
+message DeleteDeviceRequest  { uint64 id = 1; }
+message DeviceResponse       { Device device = 1; }
+message DeleteDeviceResponse { bool success = 1; }
+message ListDevicesRequest   {}
+message ListDevicesResponse  { repeated Device devices = 1; }
+
+
+--- api-service/internal/publisher/publisher.go ---
+
+package publisher
+
+import (
+    "context"
+    "encoding/json"
+    amqp "github.com/rabbitmq/amqp091-go"
+)
+
+const queueName = "device.events"
+
+type Publisher struct {
+    conn *amqp.Connection
+    ch   *amqp.Channel
+}
+
+func New(url string) (*Publisher, error) {
+    conn, err := amqp.Dial(url)
+    if err != nil { return nil, err }
+    ch, err := conn.Channel()
+    if err != nil { conn.Close(); return nil, err }
+    _, err = ch.QueueDeclare(queueName, true, false, false, false, nil)
+    if err != nil { ch.Close(); conn.Close(); return nil, err }
+    return &Publisher{conn: conn, ch: ch}, nil
+}
+
+func (p *Publisher) Publish(ctx context.Context, eventType string, device any) error {
+    body, _ := json.Marshal(struct {
+        Event  string `json:"event"`
+        Device any    `json:"device"`
+    }{Event: eventType, Device: device})
+    return p.ch.PublishWithContext(ctx, "", queueName, false, false, amqp.Publishing{
+        ContentType:  "application/json",
+        DeliveryMode: amqp.Persistent,
+        Body:         body,
+    })
+}
+
+func (p *Publisher) Close() { p.ch.Close(); p.conn.Close() }
+
+
+--- worker-service/internal/consumer/consumer.go ---
+
+package consumer
+
+import (
+    "log"
+    amqp "github.com/rabbitmq/amqp091-go"
+    "github.com/necutya/decentrilized_apps/lab2/worker-service/internal/service"
+)
+
+const queueName = "device.events"
+
+type Consumer struct {
+    conn *amqp.Connection
+    ch   *amqp.Channel
+    svc  *service.WorkerService
+}
+
+func New(url string, svc *service.WorkerService) (*Consumer, error) {
+    conn, err := amqp.Dial(url)
+    if err != nil { return nil, err }
+    ch, err := conn.Channel()
+    if err != nil { conn.Close(); return nil, err }
+    _, err = ch.QueueDeclare(queueName, true, false, false, false, nil)
+    if err != nil { ch.Close(); conn.Close(); return nil, err }
+    return &Consumer{conn: conn, ch: ch, svc: svc}, nil
+}
+
+func (c *Consumer) Consume() error {
+    msgs, err := c.ch.Consume(queueName, "", false, false, false, false, nil)
+    if err != nil { return err }
+    log.Printf("consuming queue: %s", queueName)
+    for msg := range msgs {
+        if err := c.svc.Process(msg.Body); err != nil {
+            log.Printf("process error: %v", err)
+            msg.Nack(false, true)
+            continue
+        }
+        msg.Ack(false)
+    }
+    return nil
+}
+
+func (c *Consumer) Close() { c.ch.Close(); c.conn.Close() }
+
+
+--- worker-service/internal/service/worker_service.go ---
+
+package service
+
+import (
+    "encoding/json"
+    "log"
+    "time"
+    "github.com/necutya/decentrilized_apps/lab2/worker-service/internal/model"
+    "github.com/necutya/decentrilized_apps/lab2/worker-service/internal/repo"
+)
+
+type WorkerService struct {
+    deviceRepo *repo.DeviceRepo
+    statsRepo  *repo.StatsRepo
+}
+
+func New(dr *repo.DeviceRepo, sr *repo.StatsRepo) *WorkerService {
+    return &WorkerService{deviceRepo: dr, statsRepo: sr}
+}
+
+func (w *WorkerService) Process(body []byte) error {
+    var msg model.DeviceMessage
+    if err := json.Unmarshal(body, &msg); err != nil { return err }
+
+    p := msg.Device
+    d := &model.Device{
+        ID: p.ID, Name: p.Name, Origin: p.Origin, Price: p.Price,
+        Critical: p.Critical, Peripheral: p.Peripheral, PowerWatts: p.PowerWatts,
+        HasCooler: p.HasCooler, Group: p.Group, Ports: p.Ports,
+    }
+
+    switch msg.Event {
+    case "created", "updated":
+        if err := w.deviceRepo.Upsert(d); err != nil { return err }
+    case "deleted":
+        if err := w.deviceRepo.Delete(d.ID); err != nil { return err }
+    default:
+        log.Printf("unknown event: %s", msg.Event)
+        return nil
+    }
+
+    w.statsRepo.IncrementStat(msg.Event, d.Group)
+    w.statsRepo.UpdateLastProcessed(time.Now().UTC())
+    log.Printf("processed event=%s device_id=%d", msg.Event, d.ID)
+    return nil
+}
+
+
+--- worker-service/internal/grpcserver/stats_server.go ---
+
+package grpcserver
+
+import (
+    "context"
+    "time"
+    pb "github.com/necutya/decentrilized_apps/lab2/worker-service/gen/statspb"
+    "github.com/necutya/decentrilized_apps/lab2/worker-service/internal/repo"
+    "google.golang.org/grpc/codes"
+    "google.golang.org/grpc/status"
+)
+
+type StatsServer struct {
+    pb.UnimplementedStatsServiceServer
+    statsRepo  *repo.StatsRepo
+    deviceRepo *repo.DeviceRepo
+}
+
+func NewStatsServer(statsRepo *repo.StatsRepo, deviceRepo *repo.DeviceRepo) *StatsServer {
+    return &StatsServer{statsRepo: statsRepo, deviceRepo: deviceRepo}
+}
+
+func (s *StatsServer) GetStats(ctx context.Context, _ *pb.GetStatsRequest) (*pb.StatsResponse, error) {
+    summary, err := s.statsRepo.GetSummary()
+    if err != nil { return nil, status.Error(codes.Internal, err.Error()) }
+
+    var groups []*pb.GroupCount
+    for g, c := range summary.ByGroup {
+        groups = append(groups, &pb.GroupCount{Group: g, Count: c})
+    }
+    lastAt := ""
+    if !summary.LastProcessedAt.IsZero() {
+        lastAt = summary.LastProcessedAt.Format(time.RFC3339)
+    }
+    return &pb.StatsResponse{
+        TotalCreated: summary.TotalCreated, TotalUpdated: summary.TotalUpdated,
+        TotalDeleted: summary.TotalDeleted, ByGroup: groups, LastProcessedAt: lastAt,
+    }, nil
+}
+
+func (s *StatsServer) ListDevices(ctx context.Context, _ *pb.ListDevicesRequest) (*pb.ListDevicesResponse, error) {
+    devices, err := s.deviceRepo.List()
+    if err != nil { return nil, status.Error(codes.Internal, err.Error()) }
+    var out []*pb.Device
+    for _, d := range devices { out = append(out, toProto(d)) }
+    return &pb.ListDevicesResponse{Devices: out}, nil
+}
+
+func (s *StatsServer) GetDevice(ctx context.Context, req *pb.GetDeviceRequest) (*pb.Device, error) {
+    d, err := s.deviceRepo.FindByID(req.Id)
+    if err != nil { return nil, status.Error(codes.NotFound, "device not found") }
+    return toProto(*d), nil
+}
+
+
+--- worker-service/internal/repo/stats_repo.go ---
+
+package repo
+
+import (
+    "time"
+    "github.com/necutya/decentrilized_apps/lab2/worker-service/internal/model"
+    "gorm.io/gorm"
+    "gorm.io/gorm/clause"
+)
+
+type StatsRepo struct{ db *gorm.DB }
+func NewStatsRepo(db *gorm.DB) *StatsRepo { return &StatsRepo{db: db} }
+
+func (r *StatsRepo) IncrementStat(eventType, group string) error {
+    return r.db.Transaction(func(tx *gorm.DB) error {
+        var stat model.EventStat
+        err := tx.Where("event_type = ? AND `group` = ?", eventType, group).First(&stat).Error
+        if err == gorm.ErrRecordNotFound {
+            return tx.Create(&model.EventStat{EventType: eventType, Group: group, Count: 1}).Error
+        } else if err != nil { return err }
+        return tx.Model(&stat).Update("count", stat.Count+1).Error
+    })
+}
+
+func (r *StatsRepo) UpdateLastProcessed(t time.Time) error {
+    return r.db.Clauses(clause.OnConflict{UpdateAll: true}).
+        Create(&model.LastProcessed{ID: 1, ProcessedAt: t}).Error
+}
+
+type Summary struct {
+    TotalCreated, TotalUpdated, TotalDeleted int64
+    ByGroup         map[string]int64
+    LastProcessedAt time.Time
+}
+
+func (r *StatsRepo) GetSummary() (*Summary, error) {
+    var stats []model.EventStat
+    if err := r.db.Find(&stats).Error; err != nil { return nil, err }
+    s := &Summary{ByGroup: make(map[string]int64)}
+    for _, st := range stats {
+        switch st.EventType {
+        case "created": s.TotalCreated += st.Count
+        case "updated": s.TotalUpdated += st.Count
+        case "deleted": s.TotalDeleted += st.Count
+        }
+        if st.Group != "" { s.ByGroup[st.Group] += st.Count }
+    }
+    var lp model.LastProcessed
+    if r.db.First(&lp, 1).Error == nil { s.LastProcessedAt = lp.ProcessedAt }
+    return s, nil
+}
+
+
+Висновки
+
+У ході виконання лабораторної роботи розроблено розподілений застосунок для управління каталогом комп'ютерних комплектуючих (Device) з використанням брокера повідомлень RabbitMQ.
+
+Застосунок складається з двох незалежних мікросервісів. api-service виступає точкою входу: приймає gRPC-запити, валідує дані, зберігає їх у власній SQLite БД та публікує асинхронні JSON-події до черги device.events. worker-service споживає ці події, реплікує дані у власну БД та накопичує статистику — кількість операцій створення, оновлення та видалення у розрізі груп пристроїв. Крім того, worker-service надає власний gRPC API для запиту статистики та перегляду пристроїв.
+
+Використання брокера повідомлень забезпечує слабку зв'язаність сервісів: api-service не залежить від доступності worker-service — у разі його недоступності повідомлення накопичуються в черзі й обробляються після відновлення. Механізм manual ack гарантує, що жодне повідомлення не буде втрачено через збій під час обробки.
+
+Порівняно з синхронним підходом (наприклад, прямий gRPC-виклик між сервісами), брокер повідомлень забезпечує більшу стійкість до відмов, природне горизонтальне масштабування споживачів та ізоляцію відповідальності між сервісами.

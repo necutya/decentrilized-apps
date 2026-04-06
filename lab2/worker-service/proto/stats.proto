@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package statspb;
+
+option go_package = "github.com/necutya/decentrilized_apps/lab2/worker-service/gen/statspb";
+
+// ── Stats ────────────────────────────────────────────────────────────────────
+
+message GetStatsRequest {}
+
+message GroupCount {
+  string group = 1;
+  int64  count = 2;
+}
+
+message StatsResponse {
+  int64             total_created     = 1;
+  int64             total_updated     = 2;
+  int64             total_deleted     = 3;
+  repeated GroupCount by_group        = 4;
+  string            last_processed_at = 5;
+}
+
+// ── Devices ──────────────────────────────────────────────────────────────────
+
+message ListDevicesRequest {}
+message GetDeviceRequest   { uint64 id = 1; }
+
+message DeviceType {
+  bool            peripheral  = 1;
+  int32           power_watts = 2;
+  bool            has_cooler  = 3;
+  string          group       = 4;
+  repeated string ports       = 5;
+}
+
+message Device {
+  uint64     id          = 1;
+  string     name        = 2;
+  string     origin      = 3;
+  double     price       = 4;
+  bool       critical    = 5;
+  DeviceType device_type = 6;
+}
+
+message ListDevicesResponse { repeated Device devices = 1; }
+
+service StatsService {
+  rpc GetStats    (GetStatsRequest)    returns (StatsResponse);
+  rpc ListDevices (ListDevicesRequest) returns (ListDevicesResponse);
+  rpc GetDevice   (GetDeviceRequest)   returns (Device);
+}
