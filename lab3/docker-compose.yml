@@ -1,0 +1,57 @@
+services:
+  registry:
+    build: ./registry
+    ports:
+      - "50070:50070"
+    environment:
+      GRPC_ADDR: ":50070"
+
+  node1:
+    build: ./node
+    ports:
+      - "50061:50060"
+    environment:
+      NODE_ID: node1
+      NODE_ADDR: "node1:50060"
+      GRPC_ADDR: ":50060"
+      REGISTRY_ADDR: "registry:50070"
+      DB_PATH: "/data/node.db"
+    volumes:
+      - node1-data:/data
+    depends_on:
+      - registry
+
+  node2:
+    build: ./node
+    ports:
+      - "50062:50060"
+    environment:
+      NODE_ID: node2
+      NODE_ADDR: "node2:50060"
+      GRPC_ADDR: ":50060"
+      REGISTRY_ADDR: "registry:50070"
+      DB_PATH: "/data/node.db"
+    volumes:
+      - node2-data:/data
+    depends_on:
+      - registry
+
+  node3:
+    build: ./node
+    ports:
+      - "50063:50060"
+    environment:
+      NODE_ID: node3
+      NODE_ADDR: "node3:50060"
+      GRPC_ADDR: ":50060"
+      REGISTRY_ADDR: "registry:50070"
+      DB_PATH: "/data/node.db"
+    volumes:
+      - node3-data:/data
+    depends_on:
+      - registry
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

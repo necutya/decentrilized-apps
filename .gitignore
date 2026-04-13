@@ -1,11 +1,24 @@
 # Claude settings
 .claude/
 
-# Database
+# Database files
 *.db
+*.db-shm
+*.db-wal
 
 # Protoc binary archives
 *.zip
 
 # Go build output
 *.exe
+
+# Go workspace
+go.work.sum
+
+# Docker volumes (local dev)
+**/data/
+
+# Environment files
+.env
+.env.*
+!.env.example

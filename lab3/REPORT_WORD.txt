@@ -1,0 +1,543 @@
+Лабораторна робота №3
+Тема: Децентралізовані системи
+
+
+Мета роботи
+
+Розробити децентралізовану P2P-систему бронювання квитків на основі лабораторної роботи №1. Сервер використовується виключно як реєстр вузлів. Кожен вузол має власну базу даних, приймає клієнтські запити та реплікує зміни іншим вузлам напряму. Для підтвердження автентичності відправника використовується цифровий підпис на основі алгоритму ECDSA.
+
+
+Теоретичні відомості
+
+Децентралізована система — це система, в якій відсутній єдиний центральний вузол, що керує всіма операціями. Кожен учасник (нода, пір) є рівноправним і може самостійно обробляти запити та зберігати дані. Такий підхід підвищує відмовостійкість: вихід з ладу одного вузла не порушує роботу всієї системи.
+
+P2P (Peer-to-Peer) — модель мережевої взаємодії, де вузли спілкуються напряму між собою без посередника. Кожен вузол є одночасно клієнтом і сервером.
+
+Реєстр вузлів — єдиний централізований компонент, дозволений у даній роботі. Він не обробляє бізнес-логіку, а лише зберігає адреси та публічні ключі активних нод. Ноди звертаються до реєстру для отримання списку пірів.
+
+ECDSA (Elliptic Curve Digital Signature Algorithm) — алгоритм цифрового підпису на основі еліптичних кривих. Використовується для підтвердження автентичності відправника повідомлення. Схема роботи:
+Кожна нода генерує пару ключів: приватний (зберігається локально) та публічний (публікується в реєстрі).
+При відправці повідомлення нода обчислює SHA-256 хеш даних і підписує його своїм приватним ключем.
+Отримувач завантажує публічний ключ відправника з реєстру і верифікує підпис.
+Якщо підпис невалідний — повідомлення відхиляється.
+
+Реплікація даних — механізм синхронізації стану між вузлами. У даній роботі використовується модель last-write-wins: остання операція, що надійшла до вузла, вважається актуальною. При бронюванні або скасуванні нода одразу зберігає зміни у власній БД і асинхронно (fire-and-forget) розсилає підписане повідомлення всім іншим нодам.
+
+Архітектура системи:
+
+Клієнт надсилає gRPC-запит до будь-якої ноди. Нода обробляє запит, зберігає зміни у власній SQLite базі, підписує дані ECDSA і розсилає підписане повідомлення решті нод напряму. Кожна нода-отримувач верифікує підпис через публічний ключ з реєстру і застосовує зміни до власної бази. Реєстр у цьому процесі лише надає список нод та їх публічні ключі — жодних даних застосунку він не зберігає.
+
+
+Завдання
+
+1. Реалізувати сервіс-реєстр вузлів (registry) на основі gRPC з методами Register та ListNodes.
+2. Реалізувати вузол (node) з власною SQLite базою даних та клієнтським gRPC API.
+3. Реалізувати генерацію ECDSA P-256 ключової пари при старті кожного вузла і реєстрацію публічного ключа в реєстрі.
+4. Реалізувати P2P-реплікацію: при write-операціях нода підписує дані і розсилає їх усім іншим нодам.
+5. Реалізувати верифікацію підпису на стороні вузла-отримувача перед застосуванням змін до БД.
+6. Розгорнути три ноди та реєстр у Docker і протестувати повний потік: запит → реплікація → верифікація.
+
+
+Хід роботи
+
+1. Структура проекту
+
+Проект розміщено у директорії lab3/ і складається з двох незалежних сервісів: registry та node. Обидва мають окремі go.mod файли, власні proto-специфікації та Dockerfile.
+
+Сервіс registry містить: proto-специфікацію RegistryService, згенерований код, in-memory сервер та точку входу cmd/main.go.
+
+Сервіс node містить: proto-специфікацію NodeService і PeerService, згенерований код, та внутрішні пакети: model (Event, Booking), repo (GORM + SQLite), crypto/signer.go (ECDSA генерація, підпис, верифікація), p2p/broadcaster.go (розсилка підписаних повідомлень), p2p/verifier.go (отримання публічного ключа з реєстру), service/service.go (бізнес-логіка), grpcserver (node_server.go, peer_server.go).
+
+
+2. Proto-специфікація
+
+Реєстр (registry/proto/registry.proto) має два методи: Register — нода реєструється при старті, передаючи id, адресу і публічний ключ; ListNodes — повертає список всіх зареєстрованих нод.
+
+    service RegistryService {
+      rpc Register  (RegisterRequest)  returns (RegisterResponse);
+      rpc ListNodes (ListNodesRequest) returns (ListNodesResponse);
+    }
+
+    message NodeInfo {
+      string id         = 1;
+      string address    = 2;
+      string public_key = 3;   // PEM-encoded ECDSA P-256 public key
+    }
+
+Нода (node/proto/node.proto) має два сервіси. NodeService — клієнтський API: ListEvents, BookTicket, CancelBooking, ListBookings. PeerService — внутрішній P2P API з єдиним методом Sync, який приймає підписане повідомлення від іншої ноди.
+
+    service NodeService {
+      rpc ListEvents    (ListEventsRequest)    returns (ListEventsResponse);
+      rpc BookTicket    (BookTicketRequest)    returns (BookTicketResponse);
+      rpc CancelBooking (CancelBookingRequest) returns (CancelBookingResponse);
+      rpc ListBookings  (ListBookingsRequest)  returns (ListBookingsResponse);
+    }
+
+    service PeerService {
+      rpc Sync (SyncRequest) returns (SyncResponse);
+    }
+
+    message SyncRequest {
+      SyncAction action    = 1;   // BOOK або CANCEL
+      bytes      payload   = 2;   // JSON-серіалізований Booking
+      bytes      signature = 3;   // ECDSA підпис payload
+      string     node_id   = 4;   // id відправника
+    }
+
+Генерація Go-коду виконується скриптами generate.sh у кожному сервісі.
+
+
+3. ECDSA цифровий підпис (crypto/signer.go)
+
+При старті кожна нода генерує ключову пару ECDSA P-256:
+
+    func New() *Signer {
+        priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+        return &Signer{priv: priv}
+    }
+
+Підпис повідомлення:
+
+    func (s *Signer) Sign(payload []byte) ([]byte, error) {
+        h := sha256.Sum256(payload)
+        return ecdsa.SignASN1(rand.Reader, s.priv, h[:])
+    }
+
+Публічний ключ маршалізується у PEM-формат (x509.MarshalPKIXPublicKey) і передається до реєстру при реєстрації ноди.
+
+Верифікація підпису:
+
+    func VerifySignature(pubKeyPEM string, payload, sig []byte) error {
+        block, _ := pem.Decode([]byte(pubKeyPEM))
+        pub, _ := x509.ParsePKIXPublicKey(block.Bytes)
+        h := sha256.Sum256(payload)
+        if !ecdsa.VerifyASN1(pub.(*ecdsa.PublicKey), h[:], sig) {
+            return errors.New("signature verification failed")
+        }
+        return nil
+    }
+
+
+4. Реєстр вузлів (registry)
+
+Реєстр зберігає ноди в пам'яті (map із захистом sync.RWMutex). Жодної бізнес-логіки — лише зберігання та видача списку:
+
+    type RegistryServer struct {
+        mu    sync.RWMutex
+        nodes map[string]*registrypb.NodeInfo
+    }
+
+При реєстрації нода передає свій id, мережеву адресу та PEM публічного ключа. Ці дані використовуються іншими нодами для встановлення P2P з'єднань і верифікації підписів.
+
+
+5. Запуск ноди (node/cmd/main.go)
+
+Послідовність ініціалізації:
+
+1. Відкривається SQLite база даних, виконується AutoMigrate.
+2. Якщо база порожня — заповнюється 5 тестовими подіями.
+3. Генерується ECDSA ключова пара: signer := crypto.New()
+4. Нода реєструється в реєстрі (5 спроб з інтервалом 2 секунди):
+       { id: "node1", address: "node1:50060", public_key: "-----BEGIN PUBLIC KEY-----..." }
+5. Стартує gRPC сервер з двома зареєстрованими сервісами: NodeService і PeerService.
+
+Лог успішного запуску:
+
+    2025/04/13 10:00:01 seeded 5 events
+    2025/04/13 10:00:01 registered as node1 at node1:50060
+    2025/04/13 10:00:01 node node1 listening on :50060
+
+
+6. P2P реплікація (p2p/broadcaster.go)
+
+При виклику BookTicket або CancelBooking сервіс після збереження змін у власній БД викликає broadcaster.Broadcast():
+
+    func (b *Broadcaster) Broadcast(action nodepb.SyncAction, payload []byte) {
+        sig, _ := b.signer.Sign(payload)        // ECDSA підпис
+
+        // Отримати список нод з реєстру
+        resp, _ := regClient.ListNodes(ctx, &registrypb.ListNodesRequest{})
+
+        req := &nodepb.SyncRequest{
+            Action: action, Payload: payload,
+            Signature: sig, NodeId: b.nodeID,
+        }
+
+        for _, node := range resp.Nodes {
+            if node.Id == b.nodeID { continue }   // пропустити себе
+            go sendSync(node.Address, req)         // fire-and-forget
+        }
+    }
+
+Broadcast є асинхронним: клієнт отримує відповідь одразу, реплікація відбувається у фоні.
+
+
+7. Верифікація і застосування змін (grpcserver/peer_server.go)
+
+Коли нода отримує SyncRequest від іншої ноди:
+
+1. Отримує публічний ключ відправника з реєстру за node_id.
+2. Верифікує підпис: якщо підпис невалідний — повертає codes.Unauthenticated.
+3. Десеріалізує payload у model.Booking.
+4. Застосовує до власної бази:
+       BOOK   — upsert booking + зменшення available_seats
+       CANCEL — оновлення статусу на "cancelled" + збільшення available_seats
+
+    func (s *PeerServer) Sync(_ context.Context, req *nodepb.SyncRequest) (*nodepb.SyncResponse, error) {
+        pubKeyPEM, _ := p2p.GetPublicKey(s.registryAddr, req.NodeId)
+        if err := crypto.VerifySignature(pubKeyPEM, req.Payload, req.Signature); err != nil {
+            return nil, status.Errorf(codes.Unauthenticated, "signature invalid: %v", err)
+        }
+        var b model.Booking
+        json.Unmarshal(req.Payload, &b)
+        // застосувати зміни до БД...
+        return &nodepb.SyncResponse{Ok: true}, nil
+    }
+
+
+8. Розгортання (docker-compose.yml)
+
+Запускається 4 контейнери: registry і три ноди. Кожна нода використовує той самий Docker-образ, відрізняються лише змінні середовища.
+
+    docker compose up --build
+
+Після успішного запуску:
+
+    [+] Running 4/4
+     ✔ Container lab3-registry-1  Started
+     ✔ Container lab3-node1-1     Started
+     ✔ Container lab3-node2-1     Started
+     ✔ Container lab3-node3-1     Started
+
+Порти на хості:
+registry — localhost:50070
+node1    — localhost:50061
+node2    — localhost:50062
+node3    — localhost:50063
+
+
+9. Тестування
+
+Тестування виконується скриптом test_grpc.sh за допомогою grpcurl.
+
+Крок 1 — Перегляд зареєстрованих нод у реєстрі:
+
+    grpcurl -plaintext localhost:50070 registrypb.RegistryService/ListNodes
+
+Відповідь: список трьох нод з id, address і public_key кожної.
+
+Крок 2 — Перегляд подій на усіх нодах (однакові, заповнені при старті):
+
+    grpcurl -plaintext -d '{}' localhost:50061 nodepb.NodeService/ListEvents
+
+Відповідь: 5 подій (Rock Night Live, Jazz Evening, Classical Symphony, Pop Fest 2025, Electronic Beats).
+
+Крок 3 — Бронювання на node1:
+
+    grpcurl -plaintext -d '{"event_id":1,"seats":2,"user_id":"alice"}' \
+      localhost:50061 nodepb.NodeService/BookTicket
+
+Відповідь:
+    { "booking": { "id": "1", "eventId": "1", "userId": "alice",
+                   "seats": 2, "status": "confirmed", "totalPrice": 99.98 } }
+
+node1 одночасно підписує бронювання і розсилає його на node2 та node3.
+
+Крок 4 — Перевірка реплікації на node2 і node3 (після ~1 секунди):
+
+    grpcurl -plaintext -d '{"user_id":"alice"}' localhost:50062 nodepb.NodeService/ListBookings
+    grpcurl -plaintext -d '{"user_id":"alice"}' localhost:50063 nodepb.NodeService/ListBookings
+
+Відповідь: те саме бронювання присутнє на обох нодах зі статусом "confirmed".
+
+Крок 5 — Скасування бронювання на node3:
+
+    grpcurl -plaintext -d '{"id":1,"user_id":"alice"}' \
+      localhost:50063 nodepb.NodeService/CancelBooking
+
+Відповідь: { "ok": true }
+
+node3 підписує скасування і розсилає на node1 та node2.
+
+Крок 6 — Перевірка реплікації скасування на node1 і node2:
+
+    grpcurl -plaintext -d '{"user_id":"alice"}' localhost:50061 nodepb.NodeService/ListBookings
+    grpcurl -plaintext -d '{"user_id":"alice"}' localhost:50062 nodepb.NodeService/ListBookings
+
+Відповідь: бронювання зі статусом "cancelled" на обох нодах.
+
+Крок 7 — Перевірка відновлення місць після скасування:
+
+    grpcurl -plaintext -d '{}' localhost:50061 nodepb.NodeService/ListEvents
+
+Відповідь: available_seats для події 1 повернулись до значення 200.
+
+
+Лістинг програми
+
+--- registry/proto/registry.proto ---
+
+syntax = "proto3";
+package registrypb;
+option go_package = "github.com/necutya/decentrilized_apps/lab3/registry/gen/registrypb";
+
+message NodeInfo {
+  string id         = 1;
+  string address    = 2;
+  string public_key = 3;
+}
+message RegisterRequest  { NodeInfo node = 1; }
+message RegisterResponse { bool ok = 1; }
+message ListNodesRequest {}
+message ListNodesResponse { repeated NodeInfo nodes = 1; }
+
+service RegistryService {
+  rpc Register  (RegisterRequest)  returns (RegisterResponse);
+  rpc ListNodes (ListNodesRequest) returns (ListNodesResponse);
+}
+
+
+--- node/proto/node.proto ---
+
+syntax = "proto3";
+package nodepb;
+option go_package = "github.com/necutya/decentrilized_apps/lab3/node/gen/nodepb";
+
+message Event {
+  int64  id = 1; string title = 2; string venue = 3; string date = 4;
+  int32  available_seats = 5; int32 total_seats = 6; double price = 7;
+}
+message Booking {
+  int64  id = 1; int64 event_id = 2; string user_id = 3;
+  int32  seats = 4; string status = 5; double total_price = 6;
+}
+message ListEventsRequest    {}
+message ListEventsResponse   { repeated Event events = 1; }
+message BookTicketRequest    { int64 event_id = 1; int32 seats = 2; string user_id = 3; }
+message BookTicketResponse   { Booking booking = 1; }
+message CancelBookingRequest { int64 id = 1; string user_id = 2; }
+message CancelBookingResponse { bool ok = 1; }
+message ListBookingsRequest  { string user_id = 1; }
+message ListBookingsResponse { repeated Booking bookings = 1; }
+
+service NodeService {
+  rpc ListEvents    (ListEventsRequest)    returns (ListEventsResponse);
+  rpc BookTicket    (BookTicketRequest)    returns (BookTicketResponse);
+  rpc CancelBooking (CancelBookingRequest) returns (CancelBookingResponse);
+  rpc ListBookings  (ListBookingsRequest)  returns (ListBookingsResponse);
+}
+
+enum SyncAction { BOOK = 0; CANCEL = 1; }
+message SyncRequest {
+  SyncAction action = 1; bytes payload = 2;
+  bytes signature   = 3; string node_id = 4;
+}
+message SyncResponse { bool ok = 1; }
+
+service PeerService {
+  rpc Sync (SyncRequest) returns (SyncResponse);
+}
+
+
+--- node/internal/crypto/signer.go ---
+
+package crypto
+
+import (
+    "crypto/ecdsa"
+    "crypto/elliptic"
+    "crypto/rand"
+    "crypto/sha256"
+    "crypto/x509"
+    "encoding/pem"
+    "errors"
+)
+
+type Signer struct{ priv *ecdsa.PrivateKey }
+
+func New() *Signer {
+    priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+    return &Signer{priv: priv}
+}
+
+func (s *Signer) Sign(payload []byte) ([]byte, error) {
+    h := sha256.Sum256(payload)
+    return ecdsa.SignASN1(rand.Reader, s.priv, h[:])
+}
+
+func (s *Signer) PublicKeyPEM() string {
+    der, _ := x509.MarshalPKIXPublicKey(&s.priv.PublicKey)
+    return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
+}
+
+func VerifySignature(pubKeyPEM string, payload, sig []byte) error {
+    block, _ := pem.Decode([]byte(pubKeyPEM))
+    pub, _ := x509.ParsePKIXPublicKey(block.Bytes)
+    h := sha256.Sum256(payload)
+    if !ecdsa.VerifyASN1(pub.(*ecdsa.PublicKey), h[:], sig) {
+        return errors.New("signature verification failed")
+    }
+    return nil
+}
+
+
+--- node/internal/p2p/broadcaster.go ---
+
+package p2p
+
+import (
+    "context"
+    "log"
+    "time"
+    "github.com/necutya/decentrilized_apps/lab3/node/gen/nodepb"
+    registrypb "github.com/necutya/decentrilized_apps/lab3/node/gen/registrypb"
+    "github.com/necutya/decentrilized_apps/lab3/node/internal/crypto"
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/credentials/insecure"
+)
+
+type Broadcaster struct {
+    registryAddr string
+    nodeID       string
+    signer       *crypto.Signer
+}
+
+func NewBroadcaster(registryAddr, nodeID string, signer *crypto.Signer) *Broadcaster {
+    return &Broadcaster{registryAddr: registryAddr, nodeID: nodeID, signer: signer}
+}
+
+func (b *Broadcaster) Broadcast(action nodepb.SyncAction, payload []byte) {
+    sig, _ := b.signer.Sign(payload)
+
+    conn, _ := grpc.NewClient(b.registryAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+    defer conn.Close()
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    resp, _ := registrypb.NewRegistryServiceClient(conn).ListNodes(ctx, &registrypb.ListNodesRequest{})
+    req := &nodepb.SyncRequest{
+        Action: action, Payload: payload, Signature: sig, NodeId: b.nodeID,
+    }
+    for _, node := range resp.Nodes {
+        if node.Id == b.nodeID { continue }
+        go func(addr string) {
+            if err := sendSync(addr, req); err != nil {
+                log.Printf("broadcast: sync to %s error: %v", addr, err)
+            }
+        }(node.Address)
+    }
+}
+
+
+--- node/internal/grpcserver/peer_server.go ---
+
+package grpcserver
+
+import (
+    "context"
+    "encoding/json"
+    "github.com/necutya/decentrilized_apps/lab3/node/gen/nodepb"
+    "github.com/necutya/decentrilized_apps/lab3/node/internal/crypto"
+    "github.com/necutya/decentrilized_apps/lab3/node/internal/model"
+    "github.com/necutya/decentrilized_apps/lab3/node/internal/p2p"
+    "github.com/necutya/decentrilized_apps/lab3/node/internal/repo"
+    "google.golang.org/grpc/codes"
+    "google.golang.org/grpc/status"
+)
+
+type PeerServer struct {
+    nodepb.UnimplementedPeerServiceServer
+    repo         *repo.Repo
+    registryAddr string
+}
+
+func NewPeerServer(r *repo.Repo, registryAddr string) *PeerServer {
+    return &PeerServer{repo: r, registryAddr: registryAddr}
+}
+
+func (s *PeerServer) Sync(_ context.Context, req *nodepb.SyncRequest) (*nodepb.SyncResponse, error) {
+    pubKeyPEM, err := p2p.GetPublicKey(s.registryAddr, req.NodeId)
+    if err != nil {
+        return nil, status.Errorf(codes.Unauthenticated, "lookup public key: %v", err)
+    }
+    if err := crypto.VerifySignature(pubKeyPEM, req.Payload, req.Signature); err != nil {
+        return nil, status.Errorf(codes.Unauthenticated, "signature invalid: %v", err)
+    }
+    var b model.Booking
+    if err := json.Unmarshal(req.Payload, &b); err != nil {
+        return nil, status.Errorf(codes.InvalidArgument, "unmarshal: %v", err)
+    }
+    switch req.Action {
+    case nodepb.SyncAction_BOOK:
+        s.repo.UpsertBooking(&b)
+        s.repo.DecrementSeats(b.EventID, b.Seats)
+    case nodepb.SyncAction_CANCEL:
+        s.repo.UpdateBookingStatus(b.ID, "cancelled")
+        s.repo.IncrementSeats(b.EventID, b.Seats)
+    }
+    return &nodepb.SyncResponse{Ok: true}, nil
+}
+
+
+--- node/internal/service/service.go ---
+
+package service
+
+import (
+    "encoding/json"
+    "errors"
+    "github.com/necutya/decentrilized_apps/lab3/node/gen/nodepb"
+    "github.com/necutya/decentrilized_apps/lab3/node/internal/model"
+    "github.com/necutya/decentrilized_apps/lab3/node/internal/p2p"
+    "github.com/necutya/decentrilized_apps/lab3/node/internal/repo"
+)
+
+type Service struct {
+    repo        *repo.Repo
+    broadcaster *p2p.Broadcaster
+}
+
+func New(r *repo.Repo, b *p2p.Broadcaster) *Service { return &Service{repo: r, broadcaster: b} }
+
+func (s *Service) BookTicket(eventID int64, seats int32, userID string) (*model.Booking, error) {
+    event, err := s.repo.GetEvent(eventID)
+    if err != nil { return nil, errors.New("event not found") }
+    if event.AvailableSeats < seats { return nil, errors.New("not enough seats") }
+
+    s.repo.DecrementSeats(eventID, seats)
+    booking := &model.Booking{
+        EventID: eventID, UserID: userID, Seats: seats,
+        Status: "confirmed", TotalPrice: float64(seats) * event.Price,
+    }
+    s.repo.CreateBooking(booking)
+
+    payload, _ := json.Marshal(booking)
+    s.broadcaster.Broadcast(nodepb.SyncAction_BOOK, payload)
+    return booking, nil
+}
+
+func (s *Service) CancelBooking(id int64, userID string) error {
+    booking, err := s.repo.GetBooking(id)
+    if err != nil { return errors.New("booking not found") }
+    if booking.UserID != userID { return errors.New("unauthorized") }
+    if booking.Status == "cancelled" { return errors.New("already cancelled") }
+
+    s.repo.UpdateBookingStatus(id, "cancelled")
+    s.repo.IncrementSeats(booking.EventID, booking.Seats)
+
+    booking.Status = "cancelled"
+    payload, _ := json.Marshal(booking)
+    s.broadcaster.Broadcast(nodepb.SyncAction_CANCEL, payload)
+    return nil
+}
+
+
+Висновки
+
+У ході виконання лабораторної роботи розроблено децентралізовану P2P-систему бронювання квитків на основі предметної області лабораторної роботи №1. Система складається з реєстру вузлів та трьох рівноправних нод, кожна з яких має власну SQLite базу даних і може самостійно обробляти клієнтські запити.
+
+Реєстр виконує єдину дозволену централізовану роль — зберігає адреси та публічні ключі активних нод. Вся бізнес-логіка зосереджена в нодах без участі центрального сервера.
+
+Цілісність і автентичність P2P-повідомлень забезпечується цифровим підписом ECDSA P-256. Кожна нода генерує унікальну ключову пару при старті, підписує кожне broadcast-повідомлення своїм приватним ключем, а ноди-отримувачі верифікують підпис через публічний ключ з реєстру. Це унеможливлює підробку або підміну повідомлень між нодами.
+
+Реплікація побудована за моделлю last-write-wins з асинхронним розповсюдженням (fire-and-forget), що дозволяє клієнту отримати відповідь без очікування підтвердження від усіх нод і забезпечує слабку зв'язаність між учасниками системи.

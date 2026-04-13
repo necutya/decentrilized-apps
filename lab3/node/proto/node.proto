@@ -1,0 +1,53 @@
+syntax = "proto3";
+package nodepb;
+option go_package = "github.com/necutya/decentrilized_apps/lab3/node/gen/nodepb";
+
+message Event {
+  int64  id              = 1;
+  string title           = 2;
+  string venue           = 3;
+  string date            = 4;
+  int32  available_seats = 5;
+  int32  total_seats     = 6;
+  double price           = 7;
+}
+
+message Booking {
+  int64  id          = 1;
+  int64  event_id    = 2;
+  string user_id     = 3;
+  int32  seats       = 4;
+  string status      = 5;
+  double total_price = 6;
+}
+
+message ListEventsRequest    {}
+message ListEventsResponse   { repeated Event events = 1; }
+message BookTicketRequest    { int64 event_id = 1; int32 seats = 2; string user_id = 3; }
+message BookTicketResponse   { Booking booking = 1; }
+message CancelBookingRequest { int64 id = 1; string user_id = 2; }
+message CancelBookingResponse { bool ok = 1; }
+message ListBookingsRequest  { string user_id = 1; }
+message ListBookingsResponse { repeated Booking bookings = 1; }
+
+service NodeService {
+  rpc ListEvents    (ListEventsRequest)    returns (ListEventsResponse);
+  rpc BookTicket    (BookTicketRequest)    returns (BookTicketResponse);
+  rpc CancelBooking (CancelBookingRequest) returns (CancelBookingResponse);
+  rpc ListBookings  (ListBookingsRequest)  returns (ListBookingsResponse);
+}
+
+enum SyncAction { BOOK = 0; CANCEL = 1; }
+
+message SyncRequest {
+  SyncAction action    = 1;
+  bytes      payload   = 2;
+  bytes      signature = 3;
+  string     node_id   = 4;
+}
+
+message SyncResponse { bool ok = 1; }
+
+service PeerService {
+  rpc Sync (SyncRequest) returns (SyncResponse);
+}
